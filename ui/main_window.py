@@ -35,9 +35,11 @@ class PlaylistManagerUI:
         # Setup callbacks
         self.audio_manager.set_position_callback(self.on_position_update)
         self.audio_manager.set_song_finished_callback(self.on_song_finished)
+        self.audio_manager.set_halt_completed_callback(self.on_halt_completed)
         
         # Setup network commands
         self.network_listener.register_command("AdvanceSong", self.advance_song)
+        self.network_listener.register_command("HaltMusic", self.halt_music)
         
         # Setup UI
         self.setup_ui()
@@ -251,6 +253,27 @@ class PlaylistManagerUI:
             self.play_current_song()
         else:
             self.status_bar.set_status("Playlist completed")
+    
+    def halt_music(self):
+        """Halt current music with fade (called by network command)"""
+        if self.audio_manager.is_playing:
+            self.status_bar.set_status("Halting music...")
+            self.audio_manager.halt_music()
+        else:
+            self.status_bar.set_status("No music playing to halt")
+    
+    def on_halt_completed(self):
+        """Called when halt fade is completed"""
+        current_song = self.playlist.current_song
+        if current_song:
+            index = self.playlist.current_index
+            total = len(self.playlist)
+            filename = os.path.basename(current_song.file_path)
+            self.status_bar.set_status(
+                f"Halted: {filename} ({index + 1}/{total}) - Ready for next command"
+            )
+        else:
+            self.status_bar.set_status("Music halted - Ready for next command")
     
     def on_playlist_stop(self):
         """Stop playlist playback"""

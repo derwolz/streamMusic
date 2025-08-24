@@ -13,7 +13,8 @@ class AudioManager:
     def __init__(self):
         self.is_playing = False
         self.is_preview_playing = False
-        self.fade_duration = 0.5  # Half second fade
+        self.fade_duration = 0.5  # Half second fade for normal songs
+        self.halt_fade_duration = 1.0  # One second fade for halt command
         self.current_song_volume = 1.0  # Track current song's base volume
         
         # Preview tracking
@@ -27,9 +28,14 @@ class AudioManager:
         self.position_update_timer: Optional[threading.Timer] = None
         self.active_fade_timers = []
         
+        # Halt state
+        self.is_halting = False
+        self.halt_fade_timer: Optional[threading.Timer] = None
+        
         # Callbacks
         self.position_callback: Optional[Callable[[float], None]] = None
         self.song_finished_callback: Optional[Callable[[], None]] = None
+        self.halt_completed_callback: Optional[Callable[[], None]] = None
     
     def set_position_callback(self, callback: Callable[[float], None]) -> None:
         """Set callback for position updates"""
@@ -38,6 +44,10 @@ class AudioManager:
     def set_song_finished_callback(self, callback: Callable[[], None]) -> None:
         """Set callback for when song finishes"""
         self.song_finished_callback = callback
+    
+    def set_halt_completed_callback(self, callback: Callable[[], None]) -> None:
+        """Set callback for when halt is completed"""
+        self.halt_completed_callback = callback
     
     def load_file(self, file_path: str) -> None:
         """Load an audio file"""
@@ -96,9 +106,12 @@ class AudioManager:
     
     def play_song(self, song: Song) -> None:
         """Play a full song with fade out"""
-        pygame.mixer.music.set_volume(song.volume)  # Set song-specific volume
+        # Always ensure volume is reset to song volume before playing
+        # This is especially important after a halt command has faded to 0
+        pygame.mixer.music.set_volume(song.volume)
         pygame.mixer.music.play(start=song.start_time)
         self.is_playing = True
+        self.is_halting = False
         
         # Store current song volume for fade calculations
         self.current_song_volume = song.volume
@@ -115,12 +128,37 @@ class AudioManager:
         self.end_timer = threading.Timer(duration, self._song_finished)
         self.end_timer.start()
     
+    def halt_music(self) -> None:
+        """Halt music with 1-second fade"""
+        if not self.is_playing or self.is_halting:
+            return
+        
+        self.is_halting = True
+        
+        # Cancel existing timers since we're taking control
+        if self.fade_timer:
+            self.fade_timer.cancel()
+            self.fade_timer = None
+        
+        if self.end_timer:
+            self.end_timer.cancel()
+            self.end_timer = None
+        
+        # Cancel any active fade timers
+        for timer in self.active_fade_timers:
+            timer.cancel()
+        self.active_fade_timers.clear()
+        
+        # Start halt fade
+        self._start_halt_fade()
+    
     def stop_playback(self) -> None:
         """Stop all playback"""
         self.cancel_all_timers()
         pygame.mixer.music.stop()
         pygame.mixer.music.set_volume(1.0)
         self.is_playing = False
+        self.is_halting = False
     
     def get_current_position(self) -> float:
         """Get current playback position"""
@@ -144,6 +182,10 @@ class AudioManager:
         if self.position_update_timer:
             self.position_update_timer.cancel()
             self.position_update_timer = None
+        
+        if self.halt_fade_timer:
+            self.halt_fade_timer.cancel()
+            self.halt_fade_timer = None
             
         # Cancel all fade step timers
         for timer in self.active_fade_timers:
@@ -177,11 +219,17 @@ class AudioManager:
     
     def _start_fade_out(self) -> None:
         """Start the fade out process"""
-        self._fade_out_volume(self.current_song_volume)
+        if not self.is_halting:  # Only fade if we're not halting
+            self._fade_out_volume(self.current_song_volume)
+    
+    def _start_halt_fade(self) -> None:
+        """Start the halt fade process"""
+        current_volume = pygame.mixer.music.get_volume()
+        self._halt_fade_out_volume(current_volume)
     
     def _fade_out_volume(self, current_volume: float) -> None:
         """Recursively fade out the volume"""
-        if current_volume <= 0:
+        if current_volume <= 0 or self.is_halting:
             pygame.mixer.music.set_volume(0)
             return
             
@@ -192,17 +240,61 @@ class AudioManager:
         new_volume = max(0, current_volume - volume_step)
         pygame.mixer.music.set_volume(new_volume)
         
-        if new_volume > 0:
+        if new_volume > 0 and not self.is_halting:
             fade_timer = threading.Timer(step_duration, 
                                        lambda: self._fade_out_volume(new_volume))
             self.active_fade_timers.append(fade_timer)
             fade_timer.start()
     
-    def _song_finished(self) -> None:
-        """Called when current song finishes"""
+    def _halt_fade_out_volume(self, current_volume: float) -> None:
+        """Recursively fade out the volume for halt command"""
+        if current_volume <= 0:
+            pygame.mixer.music.stop()
+            # Reset volume to 1.0 so next song can set its proper volume
+            pygame.mixer.music.set_volume(1.0)
+            self.is_playing = False
+            self.is_halting = False
+            
+            # Notify that halt is completed
+            if self.halt_completed_callback:
+                self.halt_completed_callback()
+            return
+            
+        fade_steps = 40  # More steps for smoother 1-second fade
+        volume_step = current_volume / fade_steps
+        step_duration = self.halt_fade_duration / fade_steps
+        
+        new_volume = max(0, current_volume - volume_step)
+        pygame.mixer.music.set_volume(new_volume)
+        
+        if new_volume > 0:
+            halt_fade_timer = threading.Timer(step_duration, 
+                                            lambda: self._halt_fade_out_volume(new_volume))
+            self.active_fade_timers.append(halt_fade_timer)
+            halt_fade_timer.start()
+        else:
+            # Final step - stop the music
+            self.halt_fade_timer = threading.Timer(step_duration, self._halt_complete)
+            self.halt_fade_timer.start()
+    
+    def _halt_complete(self) -> None:
+        """Complete the halt process"""
         pygame.mixer.music.stop()
+        # Reset volume to 1.0 so next song can set its proper volume
         pygame.mixer.music.set_volume(1.0)
         self.is_playing = False
+        self.is_halting = False
         
-        if self.song_finished_callback:
-            self.song_finished_callback()
+        # Notify that halt is completed
+        if self.halt_completed_callback:
+            self.halt_completed_callback()
+    
+    def _song_finished(self) -> None:
+        """Called when current song finishes"""
+        if not self.is_halting:  # Only process if not halting
+            pygame.mixer.music.stop()
+            pygame.mixer.music.set_volume(1.0)
+            self.is_playing = False
+            
+            if self.song_finished_callback:
+                self.song_finished_callback()
